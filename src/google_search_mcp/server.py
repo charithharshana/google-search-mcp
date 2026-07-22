@@ -3650,6 +3650,8 @@ def _download_audio(url: str, cache_dir: str) -> dict:
         "outtmpl": audio_path + ".%(ext)s",
         "quiet": True,
         "no_warnings": True,
+        # progress bar writes to stdout, which corrupts the MCP stdio channel
+        "noprogress": True,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -4023,6 +4025,8 @@ def _download_video(url: str) -> dict:
         "outtmpl": cached,
         "quiet": True,
         "no_warnings": True,
+        # progress bar writes to stdout, which corrupts the MCP stdio channel
+        "noprogress": True,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
