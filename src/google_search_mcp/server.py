@@ -3537,7 +3537,7 @@ async def ocr_image(image_source: str) -> str:
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
-        return "rapidocr-onnxruntime is required for OCR. Install with: pip install rapidocr-onnxruntime"
+        return 'OCR is an optional feature. Install with: pip install "noapi-google-search-mcp[ocr]"'
 
     # Handle base64 input
     tmp_base64_path = None
@@ -4523,6 +4523,12 @@ def _read_pdf_text(file_path: str) -> str:
     # Attempt 2: OCR via our existing pipeline (for scanned PDFs)
     try:
         from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        # OCR is an optional extra. Without it we simply cannot OCR scanned
+        # PDFs; the caller surfaces the install hint. Install with:
+        #   pip install "noapi-google-search-mcp[ocr]"
+        return ""
+    try:
         import cv2
         import tempfile
 
@@ -4612,7 +4618,7 @@ async def read_document(
             return (
                 f"Could not extract text from {filename}.\n"
                 "For text PDFs, install poppler-utils: sudo apt install poppler-utils\n"
-                "For scanned PDFs, ensure rapidocr-onnxruntime is installed."
+                'For scanned PDFs, OCR is optional — install with: pip install "noapi-google-search-mcp[ocr]"'
             )
         return f"Document: {filename} ({size_kb:.0f} KB)\n\n{text}"
 

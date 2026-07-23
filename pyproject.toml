@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "noapi-google-search-mcp"
-version = "0.3.1"
+version = "0.3.2"
 description = "38 tools for Local LLMs — Google Search, live feeds, email, documents, QR codes, Wikipedia, S3 upload, vision, OCR, video transcription. No API key required."
 readme = "README.md"
 license = "MIT"
@@ -26,12 +26,19 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0.0",
-    "playwright>=1.40.0",
+    "playwright>=1.48.0",
     "opencv-python-headless>=4.8.0",
-    "rapidocr-onnxruntime>=1.4.0",
     "yt-dlp>=2024.0",
     "faster-whisper>=1.0.0",
 ]
+
+[project.optional-dependencies]
+# OCR is opt-in: rapidocr-onnxruntime has no Python 3.13 wheel upstream yet
+# (RapidAI/RapidOCR#579), so keeping it out of the core install lets the
+# package install everywhere. Add it explicitly with the [ocr] extra:
+#   pip install "noapi-google-search-mcp[ocr]"
+ocr = ["rapidocr-onnxruntime>=1.4.0"]
+all = ["rapidocr-onnxruntime>=1.4.0"]
 
 [project.scripts]
 noapi-google-search-mcp = "google_search_mcp:main"

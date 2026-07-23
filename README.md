@@ -652,6 +652,24 @@ python3 -m venv ~/.local/share/noapi-google-search-mcp
 ~/.local/share/noapi-google-search-mcp/bin/playwright install chromium
 ```
 
+### Python 3.13 / OCR
+
+The core package installs on every supported Python, including 3.13. OCR is
+opt-in because `rapidocr-onnxruntime` does not yet ship a Python 3.13 wheel
+upstream ([RapidAI/RapidOCR#579](https://github.com/RapidAI/RapidOCR/issues/579)).
+Everything except the OCR tools (`ocr_image` and the scanned-PDF fallback in
+`read_document`) works without it.
+
+To enable OCR, add the `[ocr]` extra on a compatible Python (3.10–3.12):
+
+```bash
+pipx install "noapi-google-search-mcp[ocr]"
+```
+
+If you install the core package and later call an OCR tool without the extra,
+the tool returns a short message telling you to install
+`"noapi-google-search-mcp[ocr]"` instead of crashing.
+
 ## Configuration
 
 ### LM Studio
