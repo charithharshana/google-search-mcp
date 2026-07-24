@@ -20,8 +20,8 @@ Tools provided:
     - google_flights: Search for flights between destinations
     - google_hotels: Search for hotels and accommodation
     - google_lens: Reverse image search to identify objects, products, brands
-    - google_lens_detect: Detect objects in image and identify each via Lens
-    - ocr_image: Extract text from images locally using RapidOCR (no internet needed)
+    - google_lens_detect: Detect object labels in image through Lens
+    - ocr_image: Extract text from images with RapidOCR or Lens fallback
     - transcribe_video: Download and transcribe YouTube videos with timestamps
     - search_transcript: Search a transcribed video for topics by keyword
     - extract_video_clip: Extract a video clip by topic
@@ -51,8 +51,9 @@ from datetime import datetime, timezone
 from email import policy as email_policy
 from email.parser import BytesParser as EmailParser
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
+from .lens_client import analyze_image
 from mcp.server.fastmcp import Context, FastMCP, Image
 from playwright.async_api import async_playwright
 
@@ -1725,6 +1726,7 @@ async def _do_google_finance(query: str) -> str:
                     """
                 )
 
+
             lines = [f"Google Finance: {query}\n"]
 
             if data.get("name"):
@@ -1784,6 +1786,43 @@ async def google_finance(query: str) -> str:
 # google_weather
 # ---------------------------------------------------------------------------
 
+async def _weather_fallback(location: str) -> str:
+    url = f"https://wttr.in/{quote(location)}?format=j1"
+    try:
+        payload = await asyncio.to_thread(_fetch_url_bytes, url, 20)
+        data = json.loads(payload)
+        current = (data.get("current_condition") or [{}])[0]
+        area = (data.get("nearest_area") or [{}])[0]
+        area_name = ((area.get("areaName") or [{}])[0].get("value") or location)
+        country = ((area.get("country") or [{}])[0].get("value") or "")
+        display_location = ", ".join(part for part in (area_name, country) if part)
+        lines = [f"Weather for: {display_location or location}", "", "Source: wttr.in"]
+        if current.get("observation_time"):
+            lines.append(f"As of: {current['observation_time']}")
+        if current.get("temp_C"):
+            temperature = f"Temperature: {current['temp_C']}°C"
+            if current.get("temp_F"):
+                temperature += f" ({current['temp_F']}°F)"
+            lines.append(temperature)
+        weather_desc = (current.get("weatherDesc") or [{}])[0].get("value", "")
+        if weather_desc:
+            lines.append(f"Condition: {weather_desc.strip()}")
+        if current.get("precipMM"):
+            lines.append(f"Precipitation: {current['precipMM']} mm")
+        if current.get("humidity"):
+            lines.append(f"Humidity: {current['humidity']}%")
+        if current.get("windspeedKmph"):
+            lines.append(f"Wind: {current['windspeedKmph']} km/h {current.get('winddir16Point', '')}".rstrip())
+        forecast = data.get("weather") or []
+        if forecast:
+            lines.append("\nForecast:")
+            for day in forecast[:7]:
+                lines.append(f"  {day.get('date', '')}: {day.get('maxtempC', day.get('avgtempC', ''))}° / {day.get('mintempC', '')}°")
+        return "\n".join(lines)
+    except Exception as error:
+        return f"Weather lookup failed: {error}"
+
+
 async def _do_google_weather(location: str) -> str:
     """Get weather data from Google's weather card."""
     encoded_location = quote_plus(f"weather {location}")
@@ -1797,6 +1836,9 @@ async def _do_google_weather(location: str) -> str:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _dismiss_consent(page)
             await page.wait_for_timeout(2000)
+
+            if await _is_blocked(page):
+                return await _weather_fallback(location)
 
             data = await page.evaluate(
                 """
@@ -1867,7 +1909,7 @@ async def _do_google_weather(location: str) -> str:
             )
 
             if not data.get("temp_c") and not data.get("location"):
-                return f"Could not find weather data for: {location}"
+                return await _weather_fallback(location)
 
             # Use the provided location name if Google's #wob_loc is generic
             display_location = data.get("location", location)
@@ -1906,8 +1948,8 @@ async def _do_google_weather(location: str) -> str:
 
             return "\n".join(lines)
 
-        except Exception as e:
-            return f"Weather lookup failed: {e}"
+        except Exception:
+            return await _weather_fallback(location)
 
         finally:
             await browser.close()
@@ -1934,6 +1976,129 @@ async def google_weather(location: str) -> str:
 # google_shopping
 # ---------------------------------------------------------------------------
 
+async def _bing_shopping_fallback(
+    query: str, num_results: int, _retry: bool = True
+) -> list:
+    encoded_query = quote_plus(f"{query} buy price")
+    url = f"https://www.bing.com/search?q={encoded_query}&setlang=en-us"
+
+    async with async_playwright() as pw:
+        browser, context = await _launch_browser(pw)
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(1500)
+            results = await page.evaluate(
+                """
+                (numResults) => {
+                    const results = [];
+                    const pricePattern = /(?:US?\\$|£|€|₹|Rs\\.?\\s?|USD|EUR|GBP)\\s*[\\d,.]+|\\b\\d[\\d,.]*\\s?(?:k|K|USD|EUR|GBP)\\b/g;
+                    const seen = new Set();
+                    const unwrap = (href) => {
+
+                        try {
+                            const parsed = new URL(href);
+                            const encoded = parsed.searchParams.get('u') || '';
+                            if (encoded.startsWith('a1')) {
+                                const payload = encoded.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+                                const padded = payload + '='.repeat((4 - payload.length % 4) % 4);
+                                const decoded = decodeURIComponent(atob(padded));
+                                if (decoded.startsWith('http')) return decoded;
+                            }
+                        } catch (e) {}
+                        return href;
+                    };
+                    const items = document.querySelectorAll('#b_results li.b_algo, #b_results .b_algo, main li.b_algo');
+                    for (const item of items) {
+                        if (results.length >= numResults) break;
+                        const link = item.querySelector('h2 a, a[href^="http"]');
+                        const title = item.querySelector('h2');
+                        if (!link || !title) continue;
+                        const name = (title.textContent || title.innerText || '').trim();
+                        const targetUrl = unwrap(link.href);
+                        if (!name || seen.has(targetUrl)) continue;
+                        seen.add(targetUrl);
+                        const text = (item.innerText || item.textContent || '').trim();
+                        const prices = text.match(pricePattern) || [];
+                        const image = item.querySelector('img[src^="http"]');
+                        results.push({
+                            title: name,
+                            price: prices[0] || '',
+                            store: (() => { try { return new URL(targetUrl).hostname; } catch (e) { return ''; } })(),
+                            url: targetUrl,
+                            thumbnail: image ? image.src : '',
+                        });
+                    }
+                    return results;
+                }
+                """,
+                num_results,
+            )
+            if not results:
+                import base64 as b64mod
+                from urllib.parse import parse_qs, urlsplit
+
+                for heading in await page.locator("#b_results h2").all():
+                    if len(results) >= num_results:
+                        break
+                    name = (await heading.inner_text()).strip()
+                    href = await heading.locator("a").get_attribute("href")
+                    if not name or not href:
+                        continue
+                    params = parse_qs(urlsplit(href).query)
+                    encoded_target = params.get("u", [""])[0]
+                    target = href
+                    if encoded_target.startswith("a1"):
+                        try:
+                            target = b64mod.urlsafe_b64decode(encoded_target[2:] + "===").decode()
+                        except Exception:
+                            pass
+                    results.append({
+                        "title": name,
+                        "price": "",
+                        "store": urlsplit(target).hostname or "",
+                        "url": target,
+                        "thumbnail": "",
+                    })
+            for result in results:
+                thumbnail = result.get("thumbnail", "")
+                if not thumbnail:
+                    continue
+                try:
+                    response = await context.request.get(thumbnail, timeout=8000)
+                    if response.ok:
+                        body = await response.body()
+                        if 1000 <= len(body) <= 5_000_000:
+                            result["image_bytes"] = body
+                            result["content_type"] = response.headers.get("content-type", "image/jpeg").split(";", 1)[0]
+                except Exception:
+                    pass
+            if not results and _retry:
+                return await _bing_shopping_fallback(query, num_results, _retry=False)
+            return results
+        finally:
+            await browser.close()
+
+
+async def _format_shopping_fallback(query: str, num_results: int) -> list:
+    results = await _bing_shopping_fallback(query, num_results)
+    if not results:
+        return [f"No shopping results found for: {query}"]
+    content: list = [f"Shopping fallback (Bing) Results for: {query}\n"]
+    for index, result in enumerate(results[:num_results], 1):
+        description = f"{index}. {result['title']}"
+        if result.get("price"):
+            description += f"\n   Price: {result['price']}"
+        if result.get("store"):
+            description += f"\n   Store: {result['store']}"
+        if result.get("url"):
+            description += f"\n   URL: {result['url']}"
+        content.append(description)
+        if result.get("image_bytes"):
+            content.append(Image(data=result["image_bytes"], format="jpeg"))
+    return content
+
+
 async def _do_google_shopping(query: str, num_results: int = 5) -> list:
     """Search Google Shopping for products and prices."""
     encoded_query = quote_plus(query)
@@ -1947,8 +2112,13 @@ async def _do_google_shopping(query: str, num_results: int = 5) -> list:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _dismiss_consent(page)
             await page.wait_for_timeout(2000)
+            result_source = "Google Shopping"
 
-            results = await page.evaluate(
+            if await _is_blocked(page):
+                results = await _bing_shopping_fallback(query, num_results)
+                result_source = "Shopping fallback (Bing)"
+            else:
+                results = await page.evaluate(
                 r"""
                 (numResults) => {
                     const results = [];
@@ -2066,13 +2236,16 @@ async def _do_google_shopping(query: str, num_results: int = 5) -> list:
             )
 
             if not results:
+                results = await _bing_shopping_fallback(query, num_results)
+                result_source = "Shopping fallback (Bing)"
+            if not results:
                 return f"No shopping results found for: {query}"
 
             # Handle raw text fallback
             if len(results) == 1 and results[0].get("title") == "__raw__":
                 raw = results[0].get("raw_text", "")
                 raw = re.sub(r'\n{3,}', '\n\n', raw).strip()
-                return [f"Google Shopping Results for: {query}\n\n{raw}"]
+                return [f"{result_source} Results for: {query}\n\n{raw}"]
 
             # Download product thumbnail images
             import base64 as b64mod
@@ -2107,7 +2280,7 @@ async def _do_google_shopping(query: str, num_results: int = 5) -> list:
                     continue
 
             # Build mixed content: text + inline images
-            content: list = [f"Google Shopping Results for: {query}\n"]
+            content: list = [f"{result_source} Results for: {query}\n"]
             for i, r in enumerate(results[:num_results], 1):
                 desc = f"{i}. {r['title']}"
                 if r.get("price"):
@@ -2134,8 +2307,11 @@ async def _do_google_shopping(query: str, num_results: int = 5) -> list:
 
             return content
 
-        except Exception as e:
-            return f"Shopping search failed: {e}"
+        except Exception:
+            try:
+                return await _format_shopping_fallback(query, num_results)
+            except Exception as error:
+                return f"Shopping search failed: {error}"
 
         finally:
             await browser.close()
@@ -2853,7 +3029,7 @@ def _is_local_file(path: str) -> bool:
     return path.startswith(("/", "~", "./", "../")) or os.path.exists(path)
 
 
-async def _do_google_lens(image_source: str) -> str:
+async def _do_google_lens_web(image_source: str) -> str:
     """Reverse image search using Google Lens. Supports URLs, local files, and base64."""
     # Handle base64 input (from drag-and-drop in LM Studio)
     tmp_base64_path = None
@@ -3108,6 +3284,37 @@ async def _do_google_lens(image_source: str) -> str:
                     pass
 
 
+async def _do_google_lens(image_source: str) -> str:
+    try:
+        data = await analyze_image(image_source)
+    except FileNotFoundError as error:
+        return str(error)
+    except Exception as error:
+        return f"Google Lens request failed: {error}"
+
+    lines = [f"Google Lens Results for image: {image_source}", "", "Transport: Chromium Lens endpoint"]
+    text = str(data.get("text", ""))
+    if text:
+        lines.extend(["", "Detected text:", text])
+
+    object_names = []
+    for name in data.get("objects", []):
+        normalized = str(name).replace("#", "")
+        if normalized.lower() in {"detectedobject-wholeimage", "detectedobject-representswholeimage"}:
+            continue
+        if normalized and normalized not in object_names:
+            object_names.append(normalized)
+    if object_names:
+        lines.extend(["", "Detected objects:"])
+        lines.extend(f"  - {name}" for name in object_names[:20])
+
+    if not text and not object_names:
+        lines.extend(["", "Google Lens processed the image but returned no text or object labels."])
+    if data.get("language"):
+        lines.append(f"Language: {data['language']}")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def google_lens(image_source: str) -> str:
     """Reverse image search using Google Lens. Identify objects, products, brands, landmarks, text in images, and find visually similar results.
@@ -3344,95 +3551,12 @@ async def _lens_upload_in_session(page, file_path: str) -> str:
 
 
 async def _do_google_lens_detect(image_path: str) -> str:
-    """Detect objects in an image and identify each via Google Lens."""
-    try:
-        import cv2
-    except ImportError:
-        return "opencv-python-headless is required for object detection. Install with: pip install opencv-python-headless"
-
-    file_path = str(Path(image_path).expanduser().resolve())
-    if not os.path.isfile(file_path):
-        return f"File not found: {image_path}"
-
-    # Detect objects
-    objects = _detect_objects(file_path)
-
-    # Create temp crops
-    import tempfile
-    img = cv2.imread(file_path)
-    if img is None:
-        return f"Could not read image: {file_path}"
-
-    crop_files = []
-    temp_dir = tempfile.mkdtemp(prefix="lens_detect_")
-    try:
-        for i, obj in enumerate(objects):
-            crop = img[obj["y"]:obj["y"] + obj["h"], obj["x"]:obj["x"] + obj["w"]]
-            crop_path = os.path.join(temp_dir, f"object_{i}_{obj['label']}.jpg")
-            cv2.imwrite(crop_path, crop)
-            crop_files.append((crop_path, obj["label"]))
-
-        if not crop_files:
-            # Fallback: no objects detected, just pass original
-            return await _do_google_lens(file_path)
-
-        # Run Lens on original + each crop in a single browser session
-        async with async_playwright() as pw:
-            browser, context = await _launch_browser(pw)
-            page = await context.new_page()
-
-            results = []
-
-            try:
-                # First: original full image
-                og_result = await _lens_upload_in_session(page, file_path)
-                results.append(("Full image (original)", og_result))
-                await page.wait_for_timeout(3000)
-
-                # Then: each detected object crop
-                for crop_path, label in crop_files:
-                    crop_result = await _lens_upload_in_session(page, crop_path)
-                    results.append((f"Object ({label})", crop_result))
-                    await page.wait_for_timeout(3000)
-
-            except Exception as e:
-                results.append(("Error", str(e)))
-
-            finally:
-                await browser.close()
-
-        # Format output
-        lines = [
-            f"Google Lens Object Detection Results",
-            f"Image: {image_path}",
-            f"Objects detected: {len(crop_files)}",
-            ""
-        ]
-        for label, result in results:
-            lines.append(f"--- {label} ---")
-            lines.append(result)
-            lines.append("")
-
-        return "\n".join(lines)
-
-    finally:
-        # Clean up temp files
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    return await _do_google_lens(image_path)
 
 
 @mcp.tool()
 async def google_lens_detect(image_source: str) -> str:
-    """Detect and identify all objects in an image using OpenCV object detection and Google Lens.
-
-    Unlike google_lens which sends the full image, this tool:
-    1. Uses OpenCV to detect distinct objects/regions in the image
-    2. Crops each object separately
-    3. Sends the original image AND each crop to Google Lens
-    4. Returns identification results for each object
-
-    This is useful when an image contains multiple items (e.g. a monitor AND a hardware device)
-    and you want each identified separately.
+    """Detect and identify object labels through the browserless Google Lens endpoint.
 
     Supports local file paths and base64-encoded image data (from drag-and-drop).
 
@@ -3444,12 +3568,6 @@ async def google_lens_detect(image_source: str) -> str:
     Args:
         image_source: Local file path or base64-encoded image data.
     """
-    # Handle base64 input
-    if _is_base64_image(image_source):
-        os.makedirs(os.path.join(os.path.expanduser("~"), ".cache", "noapi-google-search-mcp"), exist_ok=True)
-        image_source = _save_base64_image(image_source)
-    elif image_source.startswith(("http://", "https://")):
-        return "google_lens_detect only works with local files. Use google_lens for URLs."
     return await _do_google_lens_detect(image_source)
 
 
@@ -3512,16 +3630,15 @@ async def list_images(directory: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# ocr_image (local OCR using RapidOCR - no internet needed)
+# ocr_image (RapidOCR with browserless Lens fallback)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def ocr_image(image_source: str) -> str:
-    """Extract text from an image using local OCR. No internet connection needed.
+    """Extract text from an image using RapidOCR or the browserless Lens endpoint.
 
-    Uses RapidOCR (PaddleOCR models on ONNX Runtime) to read text from
-    screenshots, documents, photos of signs, labels, receipts, or any image
-    containing text. Runs entirely locally.
+    Uses RapidOCR when the optional runtime is installed and falls back to the
+    browserless Chromium Lens endpoint when it is unavailable.
 
     Supports local file paths and base64-encoded image data (from drag-and-drop).
 
@@ -3537,7 +3654,7 @@ async def ocr_image(image_source: str) -> str:
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
-        return 'OCR is an optional feature. Install with: pip install "noapi-google-search-mcp[ocr]"'
+        RapidOCR = None
 
     # Handle base64 input
     tmp_base64_path = None
@@ -3550,6 +3667,14 @@ async def ocr_image(image_source: str) -> str:
         file_path = str(Path(image_source).expanduser().resolve())
         if not os.path.isfile(file_path):
             return f"File not found: {image_source}\nPlease provide a valid file path."
+
+        if RapidOCR is None:
+            data = await analyze_image(file_path)
+            text = str(data.get("text", ""))
+            if not text:
+                return f"No text found in image: {image_source}"
+            language = data.get("language") or "unknown"
+            return f"OCR Results for: {image_source}\nSource: Chromium Lens endpoint\nLanguage: {language}\n\n--- Extracted Text ---\n{text}"
 
         engine = RapidOCR()
         result, elapse = engine(file_path)

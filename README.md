@@ -9,7 +9,7 @@ If you want to support noapi-google-mcp or gpt-oss-20B/120B-Vision and other ope
 
 **38 tools. Zero API keys. Give any local LLM real Google search, live feeds, vision, OCR, and full video understanding.**
 
-An MCP server that turns your local LLM into a fully connected assistant. Real Google results, live news and social feeds, reverse image search, offline OCR, YouTube transcription and clip extraction — all running locally through headless Chromium and open-source ML models. No API keys, no usage limits, no cloud dependency.
+An MCP server that turns your local LLM into a fully connected assistant. Real Google results, live news and social feeds, reverse image search, OCR, YouTube transcription and clip extraction — all running locally through headless Chromium and open-source ML models. No API keys, no usage limits, no cloud dependency.
 
 Works with **LM Studio**, **Claude Desktop**, **OpenClaw**, **Ollama**, and any MCP-compatible client.
 
@@ -176,7 +176,7 @@ Pull emails, generate QR codes, shorten URLs, archive pages, look up Wikipedia, 
 |------|-------------|
 | `google_lens` | Reverse image search — identify objects, products, landmarks, text |
 | `google_lens_detect` | Detect all objects in an image (OpenCV) and identify each via Lens |
-| `ocr_image` | Extract text from images locally (RapidOCR, fully offline) |
+| `ocr_image` | Extract text from images locally with RapidOCR, with a browserless Lens fallback |
 | `list_images` | List image files in a directory for use with vision tools |
 
 ### Video & Audio Intelligence — AI-Powered Video Editing
@@ -481,9 +481,9 @@ Detect all objects (OpenCV), crop each one, identify individually via Lens.
 |-----------|-------------|---------|
 | `image_source` | Local file path or base64 (required) | `"/home/user/photo.jpg"` |
 
-#### `ocr_image` — Local OCR (offline)
+#### `ocr_image` — OCR with local and Lens fallback
 
-Extract text from images using RapidOCR. No internet needed.
+Extract text from images using RapidOCR when its optional runtime is installed. On Python versions without a RapidOCR wheel, the tool automatically uses the browserless Chromium Lens endpoint instead of failing with an installation error.
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
@@ -654,21 +654,15 @@ python3 -m venv ~/.local/share/noapi-google-search-mcp
 
 ### Python 3.13 / OCR
 
-The core package installs on every supported Python, including 3.13. OCR is
-opt-in because `rapidocr-onnxruntime` does not yet ship a Python 3.13 wheel
-upstream ([RapidAI/RapidOCR#579](https://github.com/RapidAI/RapidOCR/issues/579)).
-Everything except the OCR tools (`ocr_image` and the scanned-PDF fallback in
-`read_document`) works without it.
+The core package installs on every supported Python, including 3.13. RapidOCR remains optional because `rapidocr-onnxruntime` does not yet ship a Python 3.13 wheel upstream ([RapidAI/RapidOCR#579](https://github.com/RapidAI/RapidOCR/issues/579)).
 
-To enable OCR, add the `[ocr]` extra on a compatible Python (3.10–3.12):
+When RapidOCR is unavailable, `ocr_image` and the Lens tools use the browserless Chromium Lens endpoint. This avoids the Google Search CAPTCHA and does not require installing the OCR extra. To prefer local OCR on Python 3.10–3.12, install:
 
 ```bash
 pipx install "noapi-google-search-mcp[ocr]"
 ```
 
-If you install the core package and later call an OCR tool without the extra,
-the tool returns a short message telling you to install
-`"noapi-google-search-mcp[ocr]"` instead of crashing.
+The Lens transport uses the public Chromium client configuration. Set `GOOGLE_LENS_API_KEY` only when a custom Google client key is required.
 
 ## Configuration
 
