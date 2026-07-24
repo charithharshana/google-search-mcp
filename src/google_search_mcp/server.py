@@ -855,9 +855,15 @@ async def _do_google_scholar(query: str, num_results: int = 5) -> str:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _dismiss_consent(page)
-            await page.wait_for_selector("#gs_res_ccl", timeout=15000)
+            await page.wait_for_timeout(2000)
+            result_source = "Google Image"
 
-            results = await page.evaluate(
+            if await _is_blocked(page):
+                results = await _bing_images_fallback(query, num_results)
+                result_source = "Image fallback (Bing)"
+            else:
+                results = await page.evaluate(
+
                 """
                 (numResults) => {
                     const results = [];
@@ -943,6 +949,81 @@ async def google_scholar(query: str, num_results: int = 5) -> str:
 # ---------------------------------------------------------------------------
 # google_images
 # ---------------------------------------------------------------------------
+
+async def _bing_images_fallback(query: str, num_results: int, _retry: bool = True) -> list:
+    encoded_query = quote_plus(query)
+    url = f"https://www.bing.com/images/search?q={encoded_query}&setlang=en-us&qft=+filterui:photo-photo"
+
+    async with async_playwright() as pw:
+        browser, context = await _launch_browser(pw)
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+            results = await page.evaluate(
+                """
+                (numResults) => {
+                    const results = [];
+                    const seen = new Set();
+                    const items = document.querySelectorAll('a.iusc');
+                    for (const a of items) {
+                        if (results.length >= numResults) break;
+                        const meta = a.getAttribute('m') || '';
+                        if (!meta) continue;
+                        let data;
+                        try { data = JSON.parse(meta); } catch (e) { continue; }
+                        const fullUrl = data.murl || '';
+                        const title = data.t || data.desc || '';
+                        if (!fullUrl || seen.has(fullUrl)) continue;
+                        seen.add(fullUrl);
+                        const img = a.querySelector('img');
+                        const thumb = img && (img.src || img.dataset.src) ? (img.src || img.dataset.src) : (data.turl || '');
+                        results.push({
+                            title: title.replace(/[-]/g, '').trim(),
+                            url: fullUrl,
+                            thumbnail: thumb,
+                            source: data.purl || '',
+                        });
+                    }
+                    return results;
+                }
+                """,
+                num_results,
+            )
+            if not results and _retry:
+                return await _bing_images_fallback(query, num_results, _retry=False)
+            for result in results:
+                thumbnail = result.get("thumbnail", "")
+                if not thumbnail:
+                    continue
+                try:
+                    response = await context.request.get(thumbnail, timeout=8000)
+                    if response.ok:
+                        body = await response.body()
+                        if 1000 <= len(body) <= 5_000_000:
+                            result["image_bytes"] = body
+                            result["content_type"] = response.headers.get("content-type", "image/jpeg").split(";", 1)[0]
+                except Exception:
+                    pass
+            return results
+        finally:
+            await browser.close()
+
+
+async def _format_images_fallback(query: str, num_results: int) -> list:
+    results = await _bing_images_fallback(query, num_results)
+    if not results:
+        return [f"No image results found for: {query}"]
+    content: list = [f"Image fallback (Bing) Results for: {query}\n"]
+    for index, result in enumerate(results[:num_results], 1):
+        description = f"{index}. {result.get('title', 'Untitled')}"
+        if result.get("source"):
+            description += f"\n   Source: {result['source']}"
+        content.append(description)
+        if result.get("image_bytes"):
+            content.append(Image(data=result["image_bytes"], format="jpeg"))
+    return content
+
 
 @mcp.tool()
 async def google_images(query: str, num_results: int = 5) -> list:
